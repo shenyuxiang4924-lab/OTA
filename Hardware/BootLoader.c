@@ -1,8 +1,8 @@
 /*
  * @Author: popcorn shenyuxiang4924@gmail.com
  * @Date: 2026-06-03 20:40:53
- * @LastEditors: popcorn shenyuxiang4924@gmail.com
- * @LastEditTime: 2026-06-23 09:56:02
+ * @LastEditors: nikibikikii-star nikibikikii@gmail.com
+ * @LastEditTime: 2026-07-09 14:43:06
  * @FilePath: \MDK-ARMc:\Users\syx23\Desktop\OTA_Project\BootLoader\Hardware\BootLoader.c
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
@@ -41,7 +41,8 @@ typedef enum
     state_empty,
     state_new,
     state_last,
-    state_cur
+    state_cur,
+    state_error
 } CodeBlock_State;
 
 static CodeBlock_typedef CodeA = {FlashSize_Block * 1, FlashSize_Sector * 1};
@@ -51,7 +52,7 @@ static CodeBlock_typedef CodeD = {FlashSize_Block * 4, FlashSize_Sector * 4};
 static CodeBlock_typedef *CodeBlocks[4] = {&CodeA, &CodeB, &CodeC, &CodeD};
 
 #define empty_size 4
-static CodeBlock_typedef *new = NULL, *cur = NULL, *last = NULL;
+static CodeBlock_typedef *new = NULL, *cur = NULL, *last = NULL, *error = NULL;
 static CodeBlock_typedef *empty[empty_size];
 static uint8_t empty_head = 0;
 static uint8_t empty_tail = 0;
@@ -70,6 +71,8 @@ typedef enum
     BL_ROLLBACK,
     BL_JUMP2APP,
     BL_APP_INVALID,
+    BL_REPAIR,
+    BL_ROLLBACK_ERR,
     BL_Status_Num
 } BootLoader_Status;
 
@@ -155,12 +158,20 @@ void BootLoader_Test(BootLoader_Status *Cur_Status)
         {
             last = CodeBlocks[i];
         }
+        else if (CodeBlocks[i]->Code_Head.Code_State == state_error)
+        {
+            error = CodeBlocks[i];
+        }
         else
         {
             ept_push(CodeBlocks[i]);
         }
     }
-    if (new != NULL)
+    if (error != NULL)
+    {
+        *Cur_Status = BL_REPAIR;
+    }
+    else if (new != NULL)
     {
         *Cur_Status = BL_UPDATA;
     }
@@ -251,7 +262,6 @@ void BootLoader_Updata(BootLoader_Status *Cur_Status)
                 }
             }
             HAL_FLASH_Lock();
-            Head_typedef Head_reg;
             if (last != NULL)
             {
                 w25q_BlockErase(last->FlashAddr_Code);
@@ -261,20 +271,126 @@ void BootLoader_Updata(BootLoader_Status *Cur_Status)
             last = cur;
             if (cur != NULL)
             {
-                Head_reg = cur->Code_Head;
-                Head_reg.Code_State = state_last;
                 cur->Code_Head.Code_State = state_last;
-                w25q_Write(cur->FlashAddr_Head, &Head_reg, sizeof(Head_typedef));
+                w25q_Write(cur->FlashAddr_Head, &cur->Code_Head, sizeof(Head_typedef));
             }
             cur = new;
             if (new != NULL)
             {
-                Head_reg = new->Code_Head;
-                Head_reg.Code_State = state_cur;
-                new->Code_Head.Code_State = state_cur;
-                w25q_Write(new->FlashAddr_Head, &Head_reg, sizeof(Head_typedef));
+                new->Code_Head.Code_State = state_error;
+                w25q_Write(new->FlashAddr_Head, &new->Code_Head, sizeof(Head_typedef));
             }
             new = NULL;
+            *Cur_Status = BL_NO_UPDATA;
+        }
+        else
+        {
+            HAL_FLASH_Lock();
+            *Cur_Status = BL_FLASH_ERASE_ERR;
+        }
+    }
+}
+
+void BootLoader_Repair(BootLoader_Status *Cur_Status)
+{
+    if(last==NULL){
+        *Cur_Status = BL_FLASH_ERASE_ERR;
+        return;
+    }
+
+    w25q_Read(last->FlashAddr_Head, &last->Code_Head, sizeof(Head_typedef));
+    uint32_t cds = last->Code_Head.Code_Size;
+
+    if (cds > 0)
+    {
+        FLASH_EraseInitTypeDef erase_init;
+        uint32_t erase_error = 0;
+        erase_init.Banks = FLASH_BANK_1;
+        erase_init.NbPages = (cds - 1) / KernelSize_Page + 1;
+        erase_init.PageAddress = KernelAddr_App;
+        erase_init.TypeErase = FLASH_TYPEERASE_PAGES;
+        HAL_FLASH_Unlock();
+        if (HAL_FLASHEx_Erase(&erase_init, &erase_error) == HAL_OK)
+        {
+            uint32_t code_remain_len = cds;
+            uint32_t FlashAddr_Code_offset = last->FlashAddr_Code;
+            uint32_t KernelAddr_App_offset = KernelAddr_App;
+            while (code_remain_len > 0)
+            {
+                uint8_t Buffer[Buffer_Len];
+                if (code_remain_len >= Buffer_Len)
+                {
+                    w25q_Read(FlashAddr_Code_offset, Buffer, Buffer_Len);
+                    FlashAddr_Code_offset += Buffer_Len;
+                    uint32_t write_len = Buffer_Len;
+                    for (int i = 0; i < write_len; i += 2)
+                    {
+                        if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, KernelAddr_App_offset, (uint16_t)Buffer[i] | (Buffer[i + 1] << 8)) == HAL_OK)
+                        {
+                            KernelAddr_App_offset = KernelAddr_App_offset + 2;
+                            code_remain_len -= 2;
+                        }
+                        else
+                        {
+                            HAL_FLASH_Lock();
+                            *Cur_Status = BL_FLASH_WRITE_ERR;
+                            return;
+                        }
+                    }
+                }
+                else
+                {
+                    w25q_Read(FlashAddr_Code_offset, Buffer, code_remain_len);
+                    FlashAddr_Code_offset += code_remain_len;
+                    uint32_t write_len = code_remain_len;
+                    for (int i = 0; i < write_len; i += 2)
+                    {
+                        if (i + 1 < write_len)
+                        {
+                            if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, KernelAddr_App_offset, (uint16_t)Buffer[i] | (Buffer[i + 1] << 8)) == HAL_OK)
+                            {
+                                KernelAddr_App_offset = KernelAddr_App_offset + 2;
+                                code_remain_len -= 2;
+                            }
+                            else
+                            {
+                                HAL_FLASH_Lock();
+                                *Cur_Status = BL_FLASH_WRITE_ERR;
+                                return;
+                            }
+                        }
+                        else if (i + 1 >= write_len)
+                        {
+                            if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, KernelAddr_App_offset, (uint16_t)Buffer[i] | (0xff << 8)) == HAL_OK)
+                            {
+                                KernelAddr_App_offset = KernelAddr_App_offset + 2;
+                                code_remain_len = code_remain_len - 1;
+                            }
+                            else
+                            {
+                                HAL_FLASH_Lock();
+                                *Cur_Status = BL_FLASH_WRITE_ERR;
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            HAL_FLASH_Lock();
+            if (error != NULL)
+            {
+                w25q_BlockErase(error->FlashAddr_Code);
+                w25q_SectorErase(error->FlashAddr_Head);
+                ept_push(error);
+            }
+            error = NULL;
+            if (last != NULL)
+            {
+                last->Code_Head.Code_State = state_cur;
+                w25q_Write(last->FlashAddr_Head, &last->Code_Head, sizeof(Head_typedef));
+            }
+            cur = last;
+            last = NULL;
             *Cur_Status = BL_TEST;
         }
         else
@@ -345,6 +461,15 @@ void BootLoader_Run(void)
             HAL_Delay(500);
             break;
         }
+        case BL_REPAIR:
+        {
+            OLED_Clearline(3);
+            OLED_DrawOnlyString(3, 0, "Repair");
+            OLED_Map();
+            BootLoader_Repair(&Cur_Status);
+            HAL_Delay(500);
+            break;
+        }
         case BL_UPDATA:
         {
             OLED_Clearline(3);
@@ -396,39 +521,45 @@ void BootLoader_Run(void)
     }
 }
 
-void BootLoader_OTA_BlockState_print(void){
-    char* str[4]={"A: ","B: ","C: ","D: "};
+void BootLoader_OTA_BlockState_print(void)
+{
+    char *str[4] = {"A: ", "B: ", "C: ", "D: "};
     for (int i = 0; i < 4; i++)
+    {
+        if (i % 2 == 0)
         {
-            if (i % 2 == 0)
-            {
-                OLED_Clearline(i / 2);
-            }
-            switch (CodeBlocks[i]->Code_Head.Code_State)
-            {
-            case state_new:
-            {
-                OLED_DrawString(i / 2, i % 2 * 8, "%snew",str[i]);
-                break;
-            }
-            case state_cur:
-            {
-                OLED_DrawString(i / 2, i % 2 * 8, "%scur",str[i]);
-                break;
-            }
-            case state_last:
-            {
-                OLED_DrawString(i / 2, i % 2 * 8, "%slas",str[i]);
-                break;
-            }
-            default:
-            {
-                OLED_DrawString(i / 2, i % 2 * 8, "%sept",str[i]);
-                break;
-            }
-            }
-            OLED_Map();
+            OLED_Clearline(i / 2);
         }
+        switch (CodeBlocks[i]->Code_Head.Code_State)
+        {
+        case state_new:
+        {
+            OLED_DrawString(i / 2, i % 2 * 8, "%snew", str[i]);
+            break;
+        }
+        case state_cur:
+        {
+            OLED_DrawString(i / 2, i % 2 * 8, "%scur", str[i]);
+            break;
+        }
+        case state_last:
+        {
+            OLED_DrawString(i / 2, i % 2 * 8, "%slas", str[i]);
+            break;
+        }
+        case state_error:
+        {
+            OLED_DrawString(i / 2, i % 2 * 8, "%serr", str[i]);
+            break;
+        }
+        default:
+        {
+            OLED_DrawString(i / 2, i % 2 * 8, "%sept", str[i]);
+            break;
+        }
+        }
+        OLED_Map();
+    }
 }
 
 void BootLoader_OTA_Init(void)
@@ -452,9 +583,22 @@ void BootLoader_OTA_Init(void)
         {
             last = CodeBlocks[i];
         }
+        else if (CodeBlocks[i]->Code_Head.Code_State == state_error)
+        {
+            error = CodeBlocks[i];
+        }
         else
         {
             ept_push(CodeBlocks[i]);
+        }
+
+        // 完成初始化，清除error
+        if (error != NULL)
+        {
+            error->Code_Head.Code_State = state_cur;
+            w25q_Write(error->FlashAddr_Head, &error->Code_Head, sizeof(Head_typedef));
+            cur=error;
+            error=NULL;
         }
     }
 
@@ -500,14 +644,14 @@ void BootLoader_OTA_Write(uint8_t WriteOver_flag, uint8_t *Code, uint32_t Code_l
             w25q_BlockErase(new->FlashAddr_Code);
             w25q_SectorErase(new->FlashAddr_Head);
             ept_push(new);
-            new->Code_Head.Code_State=state_empty;
+            new->Code_Head.Code_State = state_empty;
         }
         new = pCodeBlock;
 
         OLED_Clearline(3);
         OLED_DrawString(3, 0, "code over");
         OLED_Map();
-        
+
         BootLoader_OTA_BlockState_print();
     }
 }
